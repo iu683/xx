@@ -1,819 +1,533 @@
-#!/usr/bin/env bash
-#
-# Hysteria 2 控制面板
-# SPDX-License-Identifier: MIT
-#
-# =========================================================
-# 1. 核心控制与全局环境初始化
-# =========================================================
-set -Eop pipefail
-export LANG=en_US.UTF-8
+#!/bin/bash
 
-# 基础目录与硬编码配置
-readonly HY_CONFIG="/etc/mo-hy2/config.yaml"
-readonly HY_BINARY="/usr/local/bin/hysteria"
-readonly HY_DIR="/root/proxynode/hy2"
-EXECUTABLE_INSTALL_PATH="/usr/local/bin/hysteria"
-SYSTEMD_SERVICES_DIR="/etc/systemd/system"
-CONFIG_DIR="/etc/mo-hy2"
-REPO_URL="https://github.com/apernet/hysteria"
-API_BASE_URL="https://api.github.com/repos/apernet/hysteria"
-CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
+# 全局高优先环境变量配置
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# 自动检测环境变量
-PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
-OPERATING_SYSTEM="${OPERATING_SYSTEM:-}"
-ARCHITECTURE="${ARCHITECTURE:-}"
-HYSTERIA_USER="${HYSTERIA_USER:-}"
-HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
+# 颜色控制 - 统一调整为绿色系列
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+LIGHT_GREEN='\033[1;32m'
+NC='\033[0m'
 
-# 终端颜色代码
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-BLUE="\033[34m"
-CYAN="\033[36m"
-RESET="\033[0m"
+CONFIG_FILE="/etc/snapshot_config.conf"
+SERVICE_NAME="system-snapshot"
+LOG_FILE="/var/log/snapshot_info.log"
 
-# =========================================================
-# 2. 官方原生底层工具函数
-# =========================================================
-has_command() {
-  local _command=$1
-  type -P "$_command" > /dev/null 2>&1
-}
+# 完全固定本地路径与脚本名称
+ADMIN_SCRIPT="/usr/bin/snapshot.sh"
 
-curl() {
-  command curl "${CURL_FLAGS[@]}" "$@"
-}
+if [ "$EUID" -ne 0 ]; then 
+    echo -e "${GREEN}错误: 请使用 root 权限运行此脚本。${NC}"
+    exit 1
+fi
 
-mktemp() {
-  command mktemp "$@" "hyservinst.XXXXXXXXXX"
-}
-
-info() { echo -e "${GREEN}[信息] $*${RESET}" >&2; }
-warn() { echo -e "${YELLOW}[警告] $*${RESET}" >&2; }
-error() { echo -e "${RED}[错误] $*${RESET}" >&2; }
-pause() { read -n 1 -s -r -p "按任意键返回菜单..." || true; echo; }
-
-generate_random_password() {
-  dd if=/dev/random bs=18 count=1 status=none | base64 | tr -d '+/=' | cut -c 1-16
-}
-
-systemctl() {
-  if ! has_command systemctl; then
-    warn "当前系统不支持 systemd，忽略守护进程操作: systemctl $*"
-    return 0
-  fi
-  command systemctl "$@"
-}
-
-install_content() {
-  local _install_flags="$1"
-  local _content="$2"
-  local _destination="$3"
-  local _overwrite="$4"
-  local _tmpfile="$(mktemp)"
-
-  echo -ne "安装 $_destination ... "
-  echo "$_content" > "$_tmpfile"
-  if [[ -z "$_overwrite" && -e "$_destination" ]]; then
-    echo -e "已存在"
-  elif install "$_install_flags" "$_tmpfile" "$_destination"; then
-    echo -e "完成"
-  fi
-  rm -f "$_tmpfile"
-}
-
-remove_file() {
-  local _target="$1"
-  echo -ne "移除 $_target ... "
-  if rm -f "$_target"; then
-    echo -e "完成"
-  fi
-}
-
-detect_package_manager() {
-  [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]] && return 0
-  has_command apt && PACKAGE_MANAGEMENT_INSTALL='apt -y --no-install-recommends install' && return 0
-  has_command dnf && PACKAGE_MANAGEMENT_INSTALL='dnf -y install' && return 0
-  has_command yum && PACKAGE_MANAGEMENT_INSTALL='yum -y install' && return 0
-  has_command apk && PACKAGE_MANAGEMENT_INSTALL='apk add --no-cache' && return 0
-  return 1
-}
-
-install_software() {
-  local _package_name="$1"
-
-  if ! detect_package_manager; then
-    error "未检测到支持的包管理器，请手动安装 $_package_name"
-    exit 65
-  fi
-
-  echo "正在安装缺失依赖: $_package_name"
-
-  if $PACKAGE_MANAGEMENT_INSTALL $_package_name >/dev/null 2>&1; then
-    echo "依赖安装成功"
-  else
-    error "无法安装 $_package_name"
-    exit 65
-  fi
-}
-
-install_netfilter_persistent() {
-  if has_command apt; then
-    export DEBIAN_FRONTEND=noninteractive
-
-    echo "安装 netfilter-persistent..."
-
-    install_software "iptables-persistent netfilter-persistent"
-
-    systemctl enable netfilter-persistent >/dev/null 2>&1
-    systemctl restart netfilter-persistent >/dev/null 2>&1
-
-    echo "netfilter-persistent 安装完成"
-  else
-    echo "当前系统不支持 netfilter-persistent，跳过"
-  fi
-}
-
-is_user_exists() { id "$1" > /dev/null 2>&1; }
-
-check_environment() {
-  if [[ "x$(uname)" == "xLinux" ]]; then
-    OPERATING_SYSTEM=linux
-  else
-    error "本脚本仅支持 Linux 系统。"
-    exit 95
-  fi
-
-  case "$(uname -m)" in
-    'i386' | 'i686') ARCHITECTURE='386' ;;
-    'amd64' | 'x86_64') ARCHITECTURE='amd64' ;;
-    'armv5tel' | 'armv6l' | 'armv7' | 'armv7l') ARCHITECTURE='arm' ;;
-    'armv8' | 'aarch64') ARCHITECTURE='arm64' ;;
-    's390x') ARCHITECTURE='s390x' ;;
-    *) error "不支持当前架构: $(uname -a)"; exit 8 ;;
-  esac
-
-  has_command curl || install_software curl
-  has_command grep || install_software grep
-  has_command jq || install_software jq
-  has_command openssl || install_software openssl
-  
-  if ! has_command iptables; then
-    install_software iptables
-  fi
-}
-
-get_installed_version() {
-  if [[ -f "$EXECUTABLE_INSTALL_PATH" ]]; then
-    local version_out
-    version_out=$("$EXECUTABLE_INSTALL_PATH" version 2>/dev/null || "$EXECUTABLE_INSTALL_PATH" -v 2>/dev/null || echo "")
-    if [[ -n "$version_out" ]]; then
-      echo "$version_out" | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || echo "未知格式"
+# ==============================================================================
+# 绝对首次运行下载逻辑：只要本地有文件，瞬间截断并直接本地运行，绝不重复下载
+# ==============================================================================
+if [ -f "$ADMIN_SCRIPT" ]; then
+    if [ "$(readlink -f "$0" 2>/dev/null)" != "$ADMIN_SCRIPT" ]; then
+        exec "$ADMIN_SCRIPT" "$@"
+    fi
+else
+    curl -sL https://raw.githubusercontent.com/iu683/uu/main/uu.sh > "$ADMIN_SCRIPT"
+    if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
+        chmod +x "$ADMIN_SCRIPT"
+        hash -r
+        exec "$ADMIN_SCRIPT" "$@"
     else
-      echo "未知版本"
+        echo -e "${GREEN}警告: 自动下载失败，请检查网络是否能正常访问 GitHub。...${NC}"
     fi
-  else
-    echo "未安装"
-  fi
+fi
+
+# TG 消息 Markdown 专用转义函数
+escape_markdown() {
+    echo -ne "$1" | sed 's/\([\._\*\[\]()~`#>+\-=|{}!]\)/\\\1/g'
 }
 
-get_latest_version() {
-  local _tmpfile=$(mktemp)
-  if ! curl -sS -H 'Accept: application/vnd.github.v3+json' "$API_BASE_URL/releases/latest" -o "$_tmpfile"; then
-    rm -f "$_tmpfile"
-    return
-  fi
-  local _tag_name=$(jq -r '.tag_name' "$_tmpfile" 2>/dev/null || echo "")
-  rm -f "$_tmpfile"
-  
-  if [[ -n "$_tag_name" ]]; then
-    echo "${_tag_name##*\/}"
-  else
-    echo ""
-  fi
-}
-
-download_hysteria() {
-  local _version="$1"
-  local _destination="$2"
-  local _download_url="$REPO_URL/releases/download/app/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
-  
-  if [[ ! "$_version" =~ "v" ]]; then
-     _version="v$_version"
-  fi
-  
-  info "正在下载官方 Hysteria 核心组件: $_download_url ..."
-  if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-    _download_url="$REPO_URL/releases/download/$_version/hysteria-$OPERATING_SYSTEM-$ARCHITECTURE"
-    if ! curl -R -H 'Cache-Control: no-cache' "$_download_url" -o "$_destination"; then
-      error "核心下载失败！请检查您的网络连接。"
-      return 11
+# 发送美化版 Telegram 通知的核心公共函数
+send_tg_notification() {
+    local token="$1" local chat="$2" local md_text="$3"
+    if [ -n "$token" ] && [ -n "$chat" ]; then
+        curl -s -X POST "https://api.telegram.org/bot$token/sendMessage" \
+            -d chat_id="$chat" \
+            -d text="$md_text" \
+            -d parse_mode="MarkdownV2" &>/dev/null
     fi
-  fi
-  return 0
 }
 
-tpl_hysteria_server_service_base() {
-  local _config_name="$1"
-  cat << EOF
+# ==============================================================================
+# 模块一：后端静默备份与远程传输逻辑
+# ==============================================================================
+run_backend_backup() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "错误: 配置文件不存在，请先运行脚本进行安装与配置。"
+        exit 1
+    fi
+    source "$CONFIG_FILE"
+    
+    # 建立前端运行与后台静默的展示区分
+    local is_interactive=0
+    if [ "$2" == "--interactive" ]; then is_interactive=1; fi
+
+    TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+    mkdir -p "$BACKUP_DIR"
+    SNAPSHOT_FILE="$BACKUP_DIR/system_snapshot_${TIMESTAMP}.tar.gz"
+    FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
+
+    touch "$LOG_FILE"
+    log_info() { echo "$(date '+%F %T') [INFO] $1" >> "$LOG_FILE"; }
+    log_error() { echo "$(date '+%F %T') [ERROR] $1" >> "$LOG_FILE"; }
+
+    log_info "========== 开始执行系统快照备份任务 =========="
+    
+    # 转义通知
+    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
+    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
+    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
+    
+    local start_msg="🚀 *系统快照备份任务启动*
+
+🖥️ *本机名称*: \`$t_name\`  
+🌐 *远程路径*: \`$t_path\`
+⏱️ *开始时间*: \`$t_time\`"
+    send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$start_msg"
+
+    if [ $is_interactive -eq 1 ]; then
+        echo -e "${GREEN}正在打包本地核心系统文件，请稍候...${NC}"
+    fi
+
+    # 系统核心打包 (屏蔽无关动态目录及快照自身)
+    tar -czf "$SNAPSHOT_FILE" \
+      --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" \
+      --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" \
+      --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/lib/apt/lists/*" \
+      --exclude="${BACKUP_DIR}/*" \
+      /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
+
+    if [ $? -eq 0 ] || [ -s "$SNAPSHOT_FILE" ]; then
+        SNAPSHOT_SIZE=$(du -h "$SNAPSHOT_FILE" | cut -f1)
+        log_info "本地快照创建成功，大小: $SNAPSHOT_SIZE"
+        
+        log_info "正在通过 SSH 自动创建远程多级备份目录结构..."
+        ssh -p "$SSH_PORT" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "mkdir -p \"$FULL_REMOTE_PATH/system_snapshots\"" &>/dev/null
+        
+        log_info "正在通过 rsync 安全传输快照至远程服务器..."
+        
+        if [ $is_interactive -eq 1 ]; then
+            echo -e "${GREEN}正在同步快照至远程服务器（展示实时进度）：${NC}"
+            # 交互式运行时展示原生进度条
+            rsync -avz --progress --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/"
+            local sync_res=$?
+        else
+            # 定时任务静默运行
+            rsync -avz --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
+            local sync_res=$?
+        fi
+        
+        if [ $sync_res -eq 0 ]; then
+            log_info "远程同步成功！文件已安全留存远端。"
+            ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "find \"$FULL_REMOTE_PATH/system_snapshots\" -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
+            
+            # 定时清理本地过期快照
+            find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
+            log_info "过期快照轮转清理完毕。"
+
+            local local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
+            
+            # 组装成功的美化 TG 消息
+            local e_size=$(escape_markdown "$SNAPSHOT_SIZE")
+            local e_count=$(escape_markdown "$local_count")
+            local e_days=$(escape_markdown "$REMOTE_SNAPSHOT_DAYS")
+            local e_ldir=$(escape_markdown "$BACKUP_DIR")
+            local e_endtime=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
+
+            local success_msg="✅ *系统快照备份任务已圆满完成*
+
+🖥️ *本机名称*: \`$t_name\`
+💾 *快照大小*: \`$e_size\`
+⏱️ *完成时间*: \`$e_endtime\`
+📂 *本地快照*: \`$e_count个\`
+☁️ *远程保留*: \`$e_days天\`
+💾 *本地路径*: \`$e_ldir\`
+📁 *远程路径*: \`$t_path\`"
+            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$success_msg"
+            log_info "========== 快照备份任务顺利结束 =========="
+        else
+            log_error "远程传输失败！原因：无法连接或没有免密授权"
+            local fail_msg="❌ *系统快照远程传输失败*
+
+🖥️ *本机名称*: \`$t_name\`
+⏱️ *发生时间*: \`$t_time\`
+⚠️ *错误原因*: 远程同步网络中断或 SSH 密钥授信失效，快照仅暂存于本地落盘目录。"
+            send_tg_notification "$BOT_TOKEN" "$CHAT_ID" "$fail_msg"
+        fi
+    else
+        log_error "快照打包失败！"
+    fi
+    if [ $is_interactive -eq 0 ]; then exit 0; fi
+}
+
+# 检测由 systemd 定时器直接触发的后端运行
+if [ "$1" == "--backend-run" ]; then
+    run_backend_backup "$@"
+fi
+
+# ==============================================================================
+# 模块二：前端交互式菜单与控制台逻辑
+# ==============================================================================
+read_with_default() {
+    local prompt="$1" local default_value="$2" local var_name="$3" local input_value
+    if [ -n "$default_value" ]; then
+        read -p "$(echo -e "${prompt} [当前值/默认: ${GREEN}${default_value}${NC}]: ")" input_value
+        if [ -z "$input_value" ]; then eval "$var_name=\"\$default_value\""; else eval "$var_name=\"\$input_value\""; fi
+    else
+        read -p "$(echo -e "${prompt}: ")" input_value
+        if [ -z "$input_value" ] && [ "$var_name" == "NEW_TARGET_USER" ]; then
+            eval "$var_name=\"root\""
+        else
+            while [ -z "$input_value" ]; do
+                echo -e "${GREEN}该项不能为空，请输入有效值${NC}"
+                read -p "$(echo -e "${prompt}: ")" input_value
+            done
+            eval "$var_name=\"\$input_value\""
+        fi
+    fi
+}
+
+load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
+
+draw_header() {
+    clear
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${GREEN}     Linux 系统快照备份工具       ${NC}"
+    echo -e "${GREEN}=================================${NC}"
+}
+
+# 时间纯汉化解析提取器
+parse_systemd_time() {
+    local raw_time="$1"
+    if [ -z "$raw_time" ] || [[ "$raw_time" == "n/a" ]] || [[ "$raw_time" == "N/A" ]]; then
+        echo "暂无记录"
+        return
+    fi
+    # 提取 YYYY-MM-DD HH:MM:SS 核心数据
+    local formatted=$(echo "$raw_time" | awk '{
+        for(i=1;i<=NF;i++) {
+            if($i ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) {
+                print $i " " $(i+1)
+                exit
+            }
+        }
+    }')
+    if [ -n "$formatted" ]; then
+        echo "$formatted"
+    else
+        echo "$raw_time"
+    fi
+}
+
+show_status_and_info() {
+    load_config
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${GREEN}当前工具状态:${NC} ${YELLOW}[未安装]${NC}"
+        echo -e "${GREEN}=================================${NC}"
+        return 1
+    fi
+    
+    local timer_active="未激活"
+    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中"; fi
+    
+    local last_run="无记录" local next_run="未安排"
+    # 修正这里的字符串匹配，或者直接判断 systemctl 状态
+    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then
+        
+        # 1. 获取下一次执行的绝对时间
+        local raw_next=$(systemctl show "${SERVICE_NAME}.timer" --property=NextElapsUSecRealtime --value 2>/dev/null)
+        if [ -n "$raw_next" ] && [ "$raw_next" != "0" ] && [ "$raw_next" != "n/a" ]; then
+            next_run=$(date -d "@$((${raw_next} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        fi
+
+        # 2. 获取上一次触发的绝对时间（如果系统有记录就用系统的）
+        local raw_last=$(systemctl show "${SERVICE_NAME}.timer" --property=LastTriggerUSecRealtime --value 2>/dev/null)
+        if [ -n "$raw_last" ] && [ "$raw_last" != "0" ] && [ "$raw_last" != "n/a" ]; then
+            last_run=$(date -d "@$((${raw_last} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        fi
+
+        # 3. 【强力兜底】如果定时器没跑过(raw_last为0)，但日志里有手动跑完的记录，就从日志拿时间
+        if [ "$last_run" == "无记录" ] && [ -f "$LOG_FILE" ]; then
+            local log_time=$(grep "快照备份任务顺利结束" "$LOG_FILE" | tail -n 1 | awk '{print $1,$2}')
+            if [ -n "$log_time" ]; then
+                last_run="$log_time (手动)"
+                
+                # 如果下次预计执行未安排，还可以用最后一次日志时间 + 间隔天数算个概数
+                if [ "$next_run" == "未安排" ]; then
+                    next_run=$(date -d "$log_time + ${BACKUP_INTERVAL_DAYS:-5} days" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+                fi
+            fi
+        fi
+    fi
+    
+    local local_usage="0 MB" local local_count=0
+    if [ -d "$BACKUP_DIR" ]; then
+        local_count=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | wc -l)
+        local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
+    fi
+    echo -e "${YELLOW}[ 自动化运行状态 ]${NC}"
+    echo -e "${GREEN} 定时任务状态:${NC} ${YELLOW}${timer_active}${NC}"
+    echo -e "${GREEN} 上次执行时间:${NC} ${YELLOW}${last_run}${NC}"
+    echo -e "${GREEN} 下次预计执行:${NC} ${YELLOW}${next_run}${NC}"
+    echo -e "${GREEN} 备份间隔天数:${NC} 每 ${YELLOW}${BACKUP_INTERVAL_DAYS:-'5'}${NC} 天自动触发一次"
+    echo -e "${GREEN}=================================${NC}"
+    echo -e "${YELLOW}[ 核心配置与数据信息 ]${NC}"
+    echo -e "${GREEN} 本机标识名称:${NC} ${YELLOW}${REMOTE_DIR_NAME:-'未配置'}${NC}"
+    echo -e "${GREEN} 远程存储目标:${NC} ${YELLOW}${TARGET_USER:-'N/A'}@${TARGET_IP:-'N/A'}:${SSH_PORT:-'22'}${NC}"
+    echo -e "${GREEN} 远程基础路径:${NC} ${YELLOW}${TARGET_BASE_DIR:-'未配置'}${NC}"
+    echo -e "${GREEN} 本地备份目录:${NC} ${YELLOW}${BACKUP_DIR:-'/backups'} ${NC}(共 ${YELLOW}${local_count}${NC} 个快照, 占用 ${YELLOW}${local_usage}${NC})"
+    echo -e "${GREEN} 轮转策略留存:${NC} 本地 ${YELLOW}${LOCAL_SNAPSHOT_KEEP:-'2'}${NC} 个 | 远程 ${YELLOW}${REMOTE_SNAPSHOT_DAYS:-'15'}${NC} 天"
+    echo -e "${GREEN}=================================${NC}"
+    return 0
+}
+
+check_requirements() {
+    for cmd in curl ssh rsync tar hostname; do
+        if ! command -v $cmd &> /dev/null; then
+            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $cmd &>/dev/null
+            elif command -v dnf &> /dev/null; then dnf install -y $cmd &>/dev/null
+            elif command -v yum &> /dev/null; then yum install -y $cmd &>/dev/null
+            fi
+        fi
+    done
+}
+
+auto_copy_ssh_key() {
+    local ip="$1" local user="$2" local port="$3"
+    local LOCAL_KEY="/root/.ssh/id_rsa.pub"
+
+    if [ ! -f "$LOCAL_KEY" ]; then
+        echo -e "${GREEN}未检测到本地公钥，正在生成新的 SSH 密钥对...${NC}"
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+        ssh-keygen -t rsa -b 4096 -f /root/.ssh/id_rsa -N "" -q
+        if [ $? -ne 0 ]; then
+            echo -e "${GREEN}❌ 密钥生成失败，请检查 ssh-keygen 是否可用${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}✅ SSH 密钥生成完成: $LOCAL_KEY${NC}"
+    else
+        echo -e "${GREEN}✅ 已检测到本地公钥: $LOCAL_KEY${NC}"
+    fi
+
+    local PUBKEY_CONTENT=$(cat "$LOCAL_KEY")
+
+    echo -e "${GREEN}⚠️ 第一次连接需要手动输入远程服务器密码进行鉴权操作${NC}"
+
+    ssh -p "$port" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$user@$ip" "bash -s" <<EOF
+        mkdir -p ~/.ssh
+        chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys
+        cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.bak
+        if ! grep -Fxq "$PUBKEY_CONTENT" ~/.ssh/authorized_keys.bak; then
+            echo "$PUBKEY_CONTENT" >> ~/.ssh/authorized_keys.bak
+        fi
+        awk '!seen[\$0]++' ~/.ssh/authorized_keys.bak > ~/.ssh/authorized_keys
+        rm -f ~/.ssh/authorized_keys.bak
+        chmod 600 ~/.ssh/authorized_keys
+        chown \$(whoami):\$(id -gn) ~/.ssh ~/.ssh/authorized_keys
+EOF
+
+    if [ $? -ne 0 ]; then
+        echo -e "${GREEN}❌ 远程操作失败，请检查网络连接、密码或端口是否正确。${NC}"
+        return 1
+    fi
+
+    echo -e "\n${GREEN}📂 正在验证远程免密读取通道状态...${NC}"
+    local verify_check=$(ssh -p "$port" -o ConnectTimeout=5 -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$user@$ip" "cat ~/.ssh/authorized_keys" 2>/dev/null)
+    
+    if [ -n "$verify_check" ]; then
+        echo -e "${GREEN}✅ 密钥同步结果最终验证通过！免密安全互信已成功建立。${NC}"
+        return 0
+    else
+        echo -e "${GREEN}❌ 强校验错误: 密钥虽已传输，但当前机器仍无法进行免密登录。${NC}"
+        return 1
+    fi
+}
+
+setup_systemd_timer() {
+cat > "/etc/systemd/system/system-snapshot.service" << EOFSERVICE
 [Unit]
-Description=Hysteria Server Service (${_config_name}.yaml)
+Description=System Snapshot Backup Service
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=$EXECUTABLE_INSTALL_PATH server --config ${CONFIG_DIR}/${_config_name}.yaml
-WorkingDirectory=$HYSTERIA_HOME_DIR
-User=$HYSTERIA_USER
-Group=$HYSTERIA_USER
-Environment=HYSTERIA_LOG_LEVEL=info
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-NoNewPrivileges=true
+Type=oneshot
+ExecStart=$ADMIN_SCRIPT --backend-run
+WorkingDirectory=/tmp
+EOFSERVICE
+
+cat > "/etc/systemd/system/system-snapshot.timer" << EOFTIMER
+[Unit]
+Description=Run System Snapshot Every ${NEW_BACKUP_INTERVAL_DAYS} Days
+
+[Timer]
+OnCalendar=*-*-1/${NEW_BACKUP_INTERVAL_DAYS} 00:00:00
+RandomizedDelaySec=4h
+Persistent=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=timers.target
+EOFTIMER
+
+    chmod 644 /etc/systemd/system/system-snapshot.*
+    systemctl daemon-reload
+    systemctl enable "system-snapshot.timer" &>/dev/null
+    systemctl restart "system-snapshot.timer" &>/dev/null
+}
+
+configure_project() {
+    load_config
+    check_requirements
+    if [ -f "$CONFIG_FILE" ]; then echo -e "${GREEN}进入修改配置模式。回车直接保留原当前值：${NC}\n"
+    else echo -e "${GREEN}进入首次安装配置向导。请输入以下参数：${NC}\n"; fi
+
+    read_with_default "请输入 Telegram Bot Token" "$BOT_TOKEN" NEW_BOT_TOKEN
+    read_with_default "请输入 Telegram Chat ID" "$CHAT_ID" NEW_CHAT_ID
+    echo
+    read_with_default "请输入远程服务器 IP 地址" "$TARGET_IP" NEW_TARGET_IP
+    read_with_default "请输入远程服务器用户名 (默认: root)" "${TARGET_USER:-root}" NEW_TARGET_USER
+    read_with_default "请输入 SSH 连接端口" "${SSH_PORT:-22}" NEW_SSH_PORT
+    echo
+    
+    auto_copy_ssh_key "$NEW_TARGET_IP" "$NEW_TARGET_USER" "$NEW_SSH_PORT"
+    if [ $? -ne 0 ]; then
+        echo -e "\n${GREEN}由于免密授权未真正生效，配置流程已强行中断，未写入任何更改。${NC}"
+        read -p "按任意键返回主菜单..." -n 1
+        return 1
+    fi
+    echo
+    
+    read_with_default "请输入远程基础备份目录" "${TARGET_BASE_DIR:-/root/remote_backup}" NEW_TARGET_BASE_DIR
+    local current_hostname=$(hostname)
+    read_with_default "请输入本机在远程的子目录名" "${REMOTE_DIR_NAME:-$current_hostname}" NEW_REMOTE_DIR_NAME
+    echo
+    read_with_default "请输入本地快照落盘目录" "${BACKUP_DIR:-/backups}" NEW_BACKUP_DIR
+    echo
+    read_with_default "请输入本地最大保留快照数量(个)" "${LOCAL_SNAPSHOT_KEEP:-2}" NEW_LOCAL_SNAPSHOT_KEEP
+    read_with_default "请输入远程快照过期删除时间(天)" "${REMOTE_SNAPSHOT_DAYS:-15}" NEW_REMOTE_SNAPSHOT_DAYS
+    echo
+    read_with_default "请输入备份执行间隔天数(1-30天)" "${BACKUP_INTERVAL_DAYS:-5}" NEW_BACKUP_INTERVAL_DAYS
+    
+    mkdir -p "$NEW_BACKUP_DIR"
+    cat > "$CONFIG_FILE" << EOF
+#!/bin/bash
+BOT_TOKEN="$NEW_BOT_TOKEN"
+CHAT_ID="$NEW_CHAT_ID"
+TARGET_IP="$NEW_TARGET_IP"
+TARGET_USER="$NEW_TARGET_USER"
+SSH_PORT="$NEW_SSH_PORT"
+TARGET_BASE_DIR="$NEW_TARGET_BASE_DIR"
+REMOTE_DIR_NAME="$NEW_REMOTE_DIR_NAME"
+BACKUP_DIR="$NEW_BACKUP_DIR"
+LOCAL_SNAPSHOT_KEEP=$NEW_LOCAL_SNAPSHOT_KEEP
+REMOTE_SNAPSHOT_DAYS=$NEW_REMOTE_SNAPSHOT_DAYS
+BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
 EOF
+    chmod 600 "$CONFIG_FILE"
+    
+    setup_systemd_timer
+    
+    echo -e "\n${GREEN}✓ 全新配置和 Systemd 自动化定时任务已同步刷新并生效！${NC}"
+    read -p "按任意键返回主菜单..." -n 1
 }
 
-# =========================================================
-# 3. 面板辅助网络与配置扩展函数
-# =========================================================
-get_public_ip() {
-    local ip
-    for cmd in "curl -4s --max-time 5" "wget -4qO- --timeout=5"; do
-        for url in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    for cmd in "curl -6s --max-time 5" "wget -6qO- --timeout=5"; do
-        for url in "https://api64.ipify.org" "https://ip.sb"; do
-            ip=$($cmd "$url" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
-        done
-    done
-    error "无法获取公网 IP 地址。" && return 1
-}
-
-check_port() {
-  local port="$1"
-  if ss -tunlp 2>/dev/null | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "$port"; then
-    return 1
-  fi
-  return 0
-}
-
-is_valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]; }
-
-get_random_port() {
-  local rand_port
-  while true; do
-    rand_port=$(shuf -i 2000-65535 -n 1)
-    if check_port "$rand_port"; then
-      echo "$rand_port" && return 0
+action_manual_backup() {
+    if [ ! -f "$CONFIG_FILE" ]; then echo -e "${GREEN}错误: 请先进行配置再执行此操作。${NC}"; else
+        echo -e "\n${GREEN}正在手动同步触发核心流程...${NC}"
+        # --interactive 参数用于向函数声明当前展示进度条
+        $ADMIN_SCRIPT --backend-run --interactive
+        echo -e "${GREEN}✓ 手动打包传输完整。${NC}"
     fi
-  done
+    read -p "按任意键返回主菜单..." -n 1
 }
 
-get_hy_status() {
-  if has_command systemctl && systemctl is-active --quiet mo-hy2 2>/dev/null; then
-    echo -e "${GREEN}● 运行中${RESET}"
-  else
-    if pgrep -f "$EXECUTABLE_INSTALL_PATH server" >/dev/null 2>&1; then
-      echo -e "${GREEN}● 运行中${RESET}"
+test_telegram() {
+    if [ ! -f "$CONFIG_FILE" ]; then 
+        echo -e "${GREEN}错误: 请先进行配置后再执行测试。${NC}"
+        read -p "按任意键返回主菜单..." -n 1
+        return 1
+    fi
+    source "$CONFIG_FILE"
+    echo -e "\n${GREEN}正在发送 Telegram 控制台连通性测试消息...${NC}"
+    
+    local FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
+    
+    # 消息转义处理
+    local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
+    local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
+    local t_days=$(escape_markdown "${BACKUP_INTERVAL_DAYS:-5}")
+    local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
+
+    local test_msg="🚀 *系统快照备份工具安装测试*
+
+📱 如果您看到此消息，说明Telegram配置成功！
+🖥️ *本机名称*: \`$t_name\`  
+🌐 *远程路径*: \`$t_path\`
+⏰ *执行频率*: 每${t_days}天一次
+⏱️ *时间*: \`$t_time\`"
+
+    # 执行带有响应捕获的发送
+    local response=$(curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+        -d chat_id="$CHAT_ID" \
+        -d text="$test_msg" \
+        -d parse_mode="MarkdownV2")
+        
+    if [[ $response == *"\"ok\":true"* ]]; then
+        echo -e "${GREEN}✓ Telegram 通知测试联通成功！请检查您的手机电报频道。${NC}\n"
     else
-      echo -e "${RED}● 未运行${RESET}"
+        echo -e "${GREEN}❌ 电报消息投递失败，请检查 Token / Chat ID 或者是机器出海网络代理。${NC}\n"
     fi
-  fi
+    read -p "按任意键返回主菜单..." -n 1
 }
 
-get_current_port_display() {
-  if [[ -f "$HY_CONFIG" ]]; then
-    local main_port jump_range
-    main_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
-    if [[ -f "$HY_DIR/hy-client.yaml" ]]; then
-      jump_range=$(grep -E '^server:' "$HY_DIR/hy-client.yaml" | awk -F ',' '{print $2}' | tr -d ' ')
-      [[ -n "$jump_range" ]] && echo "${main_port} [${jump_range}]" && return
-    fi
-    echo "${main_port:- -}"
-  else echo "-"; fi
+action_view_logs() {
+    if [ -f "$LOG_FILE" ]; then 
+        echo -e "\n${GREEN}正在加载最近的 15 条备份流日志：${NC}"
+        tail -n 15 "$LOG_FILE"
+    else echo -e "${GREEN}暂无备份任务的日志流产生。${NC}"; fi
+    read -p "按任意键返回主菜单..." -n 1
 }
 
-# =========================================================
-# 4. 面板核心交互逻辑 (证书 / 端口群)
-# =========================================================
-inst_cert() {
-  # 【修复核心1】只要进入证书配置，无条件前置创建目录，防止后面的写入和复制崩盘
-  mkdir -p /etc/mo-hy2
-  
-  echo "---------------------------------------------"
-  echo -e "Hysteria 2 协议证书申请方式如下："
-  echo -e " 1) 必应自签证书 ${YELLOW}（默认）${RESET}"
-  echo -e " 2) Acme 脚本自动申请 (需放行 80 端口)"
-  echo -e " 3) 自定义证书路径"
-  echo "---------------------------------------------"
-  local certInput
-  read -rp "请输入选项 [1-3] (直接回车默认自签): " certInput
-  certInput=${certInput:-1}
-
-  # 【修复核心2】标准化内部沙箱路径，永不抛给外部 root 独占区
-  cert_path="/etc/mo-hy2/server.crt"
-  key_path="/etc/mo-hy2/server.key"
-
-  if [[ $certInput == 2 ]]; then
-    if ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -q -w "80"; then
-      warn "检测到 80 端口已被占用，Acme 独立模式可能会失败。请确保已暂时关闭 Web 服务。"
-    fi
-
-    local vps_ip=$(get_public_ip)
-    read -rp "请输入需要申请证书的域名: " domain
-    [[ -z $domain ]] && error "未输入域名，无法执行操作！" && return 1
-    
-    info "正在检查并安装 Acme.sh 依赖..."
-    local acme_cmd="/root/.acme.sh/acme.sh"
-    if [[ ! -f "$acme_cmd" ]]; then
-      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com
-    fi
-    
-    "$acme_cmd" --set-default-ca --server letsencrypt
-    
-    info "正在向 Let's Encrypt 申请证书..."
-    if [[ "$vps_ip" =~ ":" ]]; then
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure
-    else
-      "$acme_cmd" --issue -d "${domain}" --standalone -k ec-256 --insecure
-    fi
-    
-    # 强制安装到 hysteria 自主可读的安全路径下
-    if "$acme_cmd" --install-cert -d "${domain}" --key-file "$key_path" --fullchain-file "$cert_path" --ecc; then
-      echo "$domain" > /etc/mo-hy2/ca.log
-      hy_domain=$domain
-      info "Acme 证书申请并成功分发至安全沙箱！"
-    else
-      error "Acme 证书申请失败，自动切换回自签模式。"
-      certInput=1
-    fi
-    
-  elif [[ $certInput == 3 ]]; then
-    local user_cert user_key
-    read -rp "请输入公钥文件 (fullchain.pem/crt) 的路径: " user_cert
-    read -rp "请输入密钥文件 (privkey.pem/key) 的路径: " user_key
-    read -rp "请输入证书对应的域名: " hy_domain
-    
-    if [[ -f "$user_cert" && -f "$user_key" ]]; then
-      # 通过同名复制打破父级目录的 Permission Denied 隔绝
-      cp -f "$user_cert" "$cert_path"
-      cp -f "$user_key" "$key_path"
-      info "自定义证书已成功同步解耦至内部安全区。"
-    else
-      error "找不到输入的证书文件，自动降级回自签模式。"
-      certInput=1
-    fi
-  fi
-
-  if [[ $certInput == 1 ]]; then
-    info "将使用必应自签证书作为 Hysteria 2 的节点证书"
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-    hy_domain="www.bing.com"
-  fi
-
-  # 强力收拢权限，闭环安全隔离
-  chmod 644 "$cert_path"
-  chmod 600 "$key_path"
-  if is_user_exists "hysteria"; then
-    chown -R hysteria:hysteria /etc/mo-hy2
-  fi
+uninstall_project() {
+    systemctl stop system-snapshot.timer 2>/dev/null
+    systemctl disable system-snapshot.timer 2>/dev/null
+    rm -f /etc/systemd/system/system-snapshot.*
+    systemctl daemon-reload
+    rm -f "$CONFIG_FILE" "$ADMIN_SCRIPT"
+    echo -e "${GREEN}✓ 快照工具及定时任务已从本机完全干净卸载。${NC}"
+    exit 0
 }
 
-inst_port() {
-  local default_port=""
-  [[ -f "$HY_CONFIG" ]] && default_port=$(grep -E '^listen:' "$HY_CONFIG" | awk -F ':' '{print $3}' | tr -d ' ')
-
-  local prompt_msg="设置 Hysteria 2 主端口 [1-65535] (回车随机分配): "
-  [[ -n "$default_port" ]] && prompt_msg="设置 Hysteria 2 主端口 [当前: ${default_port}, 回车不修改]: "
-
-  while true; do
-    read -rp "$prompt_msg" port
-    if [[ -z "$port" ]]; then
-      if [[ -n "$default_port" ]]; then port="$default_port" && break
-      else
-        port=$(get_random_port)
-        info "已为您随机分配未被占用端口: $port" && break
-      fi
-    elif is_valid_port "$port"; then
-      if [[ "$port" != "$default_port" ]] && ! check_port "$port"; then
-        error "端口 ${port} 已被其它程序占用，请更换。" && continue
-      fi
-      break
-    else error "请输入有效的端口数字 (1-65535)"; fi
-  done
-
-  echo "---------------------------------------------"
-  echo -e "Hysteria 2 端口群使用模式："
-  echo -e " 1) 单端口模式"
-  echo -e " 2) 端口跳跃模式 ${YELLOW}（默认)${RESET}"
-  echo "---------------------------------------------"
-  local jumpInput
-  read -rp "请选择端口模式 [1-2] (默认2): " jumpInput
-  jumpInput=${jumpInput:-2}
-
-  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
-  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
-
-  if [[ $jumpInput == 2 ]]; then
+menu_loop() {
     while true; do
-      read -rp "设置起始端口 (建议10000-65535): " firstport
-      read -rp "设置末尾端口 (必须大于起始端口): " endport
-      if is_valid_port "$firstport" && is_valid_port "$endport" && [[ $firstport -lt $endport ]]; then break
-      else error "输入无效，起始端口必须小于末尾端口，请重新输入。"; fi
+        draw_header
+        show_status_and_info
+        echo -e "${GREEN}  [1] 安装/修改配置${NC}"
+        echo -e "${GREEN}  [2] 手动执行系统快照${NC}"
+        echo -e "${GREEN}  [3] 测试Telegram连通性${NC}"
+        echo -e "${GREEN}  [4] 查看系统备份日志${NC}"
+        echo -e "${GREEN}  [5] 卸载备份工具${NC}"
+        echo -e "${GREEN}  [0] 退出${NC}"
+        echo -e "${GREEN}=================================${NC}"
+
+        read -p $'\033[32m请选择操作编号: \033[0m' choice
+        case $choice in
+            1) configure_project ;;
+            2) action_manual_backup ;;
+            3) test_telegram ;;
+            4) action_view_logs ;;
+            5) uninstall_project ;;
+            0) exit 0 ;;
+            *) sleep 1 ;;
+        esac
     done
-    iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-    ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port"
-    
-    if has_command netfilter-persistent; then
-      netfilter-persistent save >/dev/null 2>&1 || true
-    else
-      warn "缺少 netfilter-persistent 工具，端口跳跃规则可能在重启后失效。"
-    fi
-    info "已成功配置端口跳跃规则: $firstport-$endport -> $port"
-  else
-    firstport="" && endport=""
-    info "将继续使用单端口模式"
-  fi
 }
 
-write_and_show_config() {
-  local HOSTNAME=$(hostname -s | sed 's/ /_/g')
-  local vps_ip=$(get_public_ip)
-
-  # =========================================================
-  # 核心修复点：动态证书校验逻辑判定
-  # =========================================================
-  local is_insecure="0"
-  local skip_cert="false"
-  local yaml_insecure="false"
-
-  if [[ "$hy_domain" == "www.bing.com" ]]; then
-    is_insecure="1"
-    skip_cert="true"
-    yaml_insecure="true"
-  fi
-
-  cat << EOF > /etc/mo-hy2/config.yaml
-listen: :$port
-
-tls:
-  cert: $cert_path
-  key: $key_path
-
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-
-auth:
-  type: password
-  password: $auth_pwd
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://$proxysite
-    rewriteHost: true
-EOF
-
-  local last_port=$port
-  [[ -n "${firstport}" ]] && last_port="$port,$firstport-$endport"
-  
-  # 剥离双轨 IP 逻辑，无缝支持 IPv6 节点的客户端协议转换
-  local last_ip="$vps_ip"
-  local url_ip="$vps_ip"
-  if [[ "$vps_ip" =~ ":" ]]; then 
-    last_ip="[$vps_ip]"
-  fi
-
-  mkdir -p "$HY_DIR"
-  
-  cat << EOF > "$HY_DIR/hy-client.yaml"
-server: $last_ip:$last_port
-auth: $auth_pwd
-tls:
-  sni: $hy_domain
-  insecure: $yaml_insecure
-quic:
-  initStreamReceiveWindow: 16777216
-  maxStreamReceiveWindow: 16777216
-  initConnReceiveWindow: 33554432
-  maxConnReceiveWindow: 33554432
-fastOpen: true
-socks5:
-  listen: 127.0.0.1:5678
-transport:
-  udp:
-    hopInterval: 30s 
-EOF
-
-  cat << EOF > "$HY_DIR/url.txt"
-V6VPS 请自行替换 IP 地址为 V6
-V2rayN 配置分享链接:
-hysteria2://$auth_pwd@$last_ip:$port?insecure=${is_insecure}&sni=$hy_domain#$HOSTNAME-hy2
-
-Surge  配置格式:
-$HOSTNAME-hy2 = hysteria2, $url_ip, $port, password=$auth_pwd, skip-cert-verify=${skip_cert}, sni=$hy_domain
-EOF
-
-  if is_user_exists "hysteria"; then
-    chown -R hysteria:hysteria /etc/mo-hy2
-  fi
-
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl enable mo-hy2 >/dev/null 2>&1 || true
-    systemctl restart mo-hy2 >/dev/null 2>&1 || true
-    
-    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
-      info "Hysteria 2 服务配置并启动成功！"
-    else
-      error "Hysteria 2 服务启动失败，请运行 'systemctl status mo-hy2' 查看日志。"
-    fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
-    "$EXECUTABLE_INSTALL_PATH" server --config $HY_CONFIG >/dev/null 2>&1 &
-    info "非 systemd 环境，程序已挂载至后台 Pid 进程池中运行。"
-  fi
-  showconf
-}
-
-# =========================================================
-# 5. 主流程控制模块与更新功能
-# =========================================================
-insthysteria() {
-  check_environment
-  install_netfilter_persistent
-  
-  info "获取官方最新发布版本中..."
-  local latest_version=$(get_latest_version)
-  if [[ -z "$latest_version" ]]; then
-    error "无法获取最新版本号，请检查网络设置。"
-    return 1
-  fi
-  
-  local _tmpfile=$(mktemp)
-  if ! download_hysteria "$latest_version" "$_tmpfile"; then
-    rm -f "$_tmpfile" && return 1
-  fi
-
-  echo -ne "正在安装二进制可执行文件 ... "
-  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -f "$_tmpfile" && error "安装失败" && return 1
-  fi
-  rm -f "$_tmpfile"
-
-  HYSTERIA_USER="hysteria"
-  HYSTERIA_HOME_DIR="/var/lib/hysteria"
-  if ! is_user_exists "$HYSTERIA_USER"; then
-    echo -ne "正在创建系统独立沙箱运行用户 $HYSTERIA_USER ... "
-    useradd -r -d "$HYSTERIA_HOME_DIR" -m "$HYSTERIA_USER" >/dev/null 2>&1 || true
-    echo "成功"
-  fi
-
-  if has_command systemctl; then
-    install_content -Dm644 "$(tpl_hysteria_server_service_base 'config')" "$SYSTEMD_SERVICES_DIR/mo-hy2.service" "1"
-    install_content -Dm644 "$(tpl_hysteria_server_service_base '%i')" "$SYSTEMD_SERVICES_DIR/hysteria-server@.service" "1"
-  fi
-
-  firstport="" && endport=""
-  inst_cert || return 1
-  inst_port
-  
-  read -rp "设置 Hysteria 2 验证密码 (回车自动分配随机密码): " auth_pwd
-  auth_pwd=${auth_pwd:-$(generate_random_password)}
-  
-  read -rp "请输入 Hysteria 2 的伪装网站地址 (默认: en.snu.ac.kr): " proxysite
-  proxysite=${proxysite:-"en.snu.ac.kr"}
-
-  write_and_show_config
-}
-
-update_hysteria() {
-  if [[ ! -f "$HY_BINARY" ]]; then
-    error "当前系统未安装 Hysteria 2，无法执行更新。"
-    return 1
-  fi
-
-  info "正在检查新版本..."
-  local current_version=$(get_installed_version)
-  local latest_version=$(get_latest_version)
-
-  if [[ -z "$latest_version" ]]; then
-    error "无法连接到 GitHub API 获取最新版本，请稍后再试。"
-    return 1
-  fi
-
-  info "当前安装版本: ${YELLOW}${current_version}${RESET}"
-  info "官方最新版本: ${GREEN}${latest_version}${RESET}"
-
-  if [[ "$current_version" == "$latest_version" ]]; then
-    info "您当前已经是最新版本，无需更新。"
-    return 0
-  fi
-
-  warn "检测到新版本，即将开始平滑更新 (你的配置与端口规则不会改变)..."
-  
-  local _tmpfile=$(mktemp)
-  if ! download_hysteria "$latest_version" "$_tmpfile"; then
-    rm -f "$_tmpfile" && return 1
-  fi
-
-  echo -ne "正在覆盖二进制核心文件 ... "
-  if install -Dm755 "$_tmpfile" "$EXECUTABLE_INSTALL_PATH"; then
-    echo "成功"
-  else
-    rm -f "$_tmpfile" && error "覆盖核心失败" && return 1
-  fi
-  rm -f "$_tmpfile"
-
-  info "正在重启 Hysteria 2 服务以应用更新..."
-  if has_command systemctl; then
-    systemctl daemon-reload
-    systemctl restart mo-hy2 >/dev/null 2>&1 || true
-    if systemctl is-active --quiet mo-hy2 2>/dev/null; then
-      info "Hysteria 2 已成功平滑更新至 ${GREEN}${latest_version}${RESET}！"
-    else
-      error "核心更新成功，但服务重启失败，请运行 'systemctl status mo-hy2' 检查错误。"
-    fi
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
-    "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
-    info "Hysteria 2 核心已更新并于后台重启运行。"
-  fi
-}
-
-unsthysteria() {
-  warn "即将从当前系统中彻底卸载 Hysteria 2"
-
-  if has_command systemctl; then
-    systemctl stop mo-hy2 >/dev/null 2>&1 || true
-    systemctl disable mo-hy2 >/dev/null 2>&1 || true
-    remove_file "$SYSTEMD_SERVICES_DIR/mo-hy2.service"
-    remove_file "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
-    systemctl daemon-reload
-  else
-    pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
-  fi
-  
-  remove_file "$EXECUTABLE_INSTALL_PATH"
-  rm -rf /etc/mo-hy2 "$HY_DIR"
-  
-  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
-  ip6tables -t nat -F PREROUTING >/dev/null 2>&1 || true
-  has_command netfilter-persistent && netfilter-persistent save >/dev/null 2>&1 || true
-
-  info "Hysteria 2 已彻底从您的系统中移除！"
-}
-
-changeconf() {
-  if [[ ! -f "$HY_CONFIG" ]]; then
-    error "配置文件不存在，请先安装 Hysteria 2"
-    return 1
-  fi
-
-  local old_pwd=$(grep -E '^\s*password:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
-  local old_cert=$(grep -E '^\s*cert:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
-  local old_key=$(grep -E '^\s*key:' "$HY_CONFIG" | awk '{print $2}' | tr -d '"'\' || true)
-  local old_site=$(grep -E '^\s*url:' "$HY_CONFIG" | awk '{print $2}' | sed 's#https://##' | tr -d '"'\' || true)
-  local old_sni="www.bing.com"
-  [[ -f "$HY_DIR/hy-client.yaml" ]] && old_sni=$(grep -E '^\s*sni:' "$HY_DIR/hy-client.yaml" | awk '{print $2}' | tr -d '"'\' || true)
-
-  clear
-  echo -e "${GREEN}====== 修改 Hysteria 2 配置 ======${RESET}"
-  echo "提示：直接敲回车将保持原有配置不变"
-  echo "---------------------------------------------"
-  
-  firstport="" && endport=""
-  inst_port 
-
-  local auth_pwd
-  read -rp "设置 Hysteria 2 密码 [当前: ${old_pwd}, 回车不修改]: " auth_pwd
-  auth_pwd=${auth_pwd:-$old_pwd}
-
-  local cert_path key_path hy_domain
-  echo "---------------------------------------------"
-  read -rp "是否需要修改证书？[y/N] (直接回车默认不修改): " change_cert_flag
-  if [[ "$change_cert_flag" == "y" || "$change_cert_flag" == "Y" ]]; then
-    inst_cert || return 1
-  else
-    cert_path="$old_cert"
-    key_path="$old_key"
-    hy_domain="$old_sni"
-  fi
-
-  local proxysite
-  echo "---------------------------------------------"
-  read -rp "请输入新的伪装网站地址 [当前: ${old_site}, 回车不修改]: " proxysite
-  proxysite=${proxysite:-$old_site}
-
-  write_and_show_config
-  info "配置修改并应用成功！"
-}
-
-showconf() {
-  if [[ ! -d "$HY_DIR" ]]; then
-    error "未找到客户端配置文件。"
-    return
-  fi
-  echo -e "${GREEN}====== 客户端 YAML 配置 ======${RESET}"
-  cat "$HY_DIR/hy-client.yaml"
-  echo
-  echo -e "${GREEN}====== 节点分享链接 ======${RESET}"
-  cat "$HY_DIR/url.txt"
-  echo
-}
-
-# =========================================================
-# 6. 面板主菜单
-# =========================================================
-menu() {
-  [[ $EUID -ne 0 ]] && error "请切换至 root 用户运行此面板脚本。" && exit 1
-  check_environment
-
-  while true; do
-    clear
-    local status=$(get_hy_status)
-    local version=$(get_installed_version)
-    local port_show=$(get_current_port_display)
-
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}      Hysteria 2 管理面板       ${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}状态   :${RESET} $status"
-    echo -e "${GREEN}版本   :${RESET} ${YELLOW}${version}${RESET}"
-    echo -e "${GREEN}端口   :${RESET} ${YELLOW}${port_show}${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-    echo -e "${GREEN}1. 安装 Hysteria 2${RESET}"
-    echo -e "${GREEN}2. 更新 Hysteria 2${RESET}"
-    echo -e "${GREEN}3. 卸载 Hysteria 2${RESET}"
-    echo -e "${GREEN}4. 修改配置${RESET}"
-    echo -e "${GREEN}5. 启动 Hysteria 2${RESET}"
-    echo -e "${GREEN}6. 停止 Hysteria 2${RESET}"
-    echo -e "${GREEN}7. 重启 Hysteria 2${RESET}"
-    echo -e "${GREEN}8. 查看日志${RESET}"
-    echo -e "${GREEN}9. 查看节点配置${RESET}"
-    echo -e "${GREEN}0. 退出${RESET}"
-    echo -e "${GREEN}================================${RESET}"
-
-    local choice=""
-    read -r -p $'\033[32m请输入选项: \033[0m' choice || true
-    [[ -z "$choice" ]] && continue
-
-    case "$choice" in
-      1) insthysteria; pause ;;
-      2) update_hysteria; pause ;;
-      3) unsthysteria; pause ;;
-      4) changeconf; pause ;;
-      5) 
-        if has_command systemctl; then
-          systemctl start mo-hy2 && info "服务已成功启动！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
-          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
-          info "进程已在后台启动！"
-        fi
-        pause ;;
-      6) 
-        if has_command systemctl; then
-          systemctl stop mo-hy2 && info "服务已成功停止！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH server" && info "后台进程已终止！"
-        fi
-        pause ;;
-      7) 
-        if has_command systemctl; then
-          systemctl restart mo-hy2 && info "服务已成功重启！"
-        else
-          pkill -f "$EXECUTABLE_INSTALL_PATH server" || true
-          "$EXECUTABLE_INSTALL_PATH" server --config "$HY_CONFIG" >/dev/null 2>&1 &
-          info "后台进程已重启！"
-        fi
-        pause ;;
-      8) 
-        if has_command systemctl; then
-          journalctl -u mo-hy2.service -n 50 --no-pager
-        else
-          warn "当前环境不支持 systemd 集中日志管理。"
-        fi
-        pause ;;
-      9) showconf; pause ;;
-      0) exit 0 ;;
-      *) error "无效输入，请重新选择。"; sleep 1 ;;
-    esac
-  done
-}
-
-menu "$@"
+menu_loop
