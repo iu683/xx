@@ -29,7 +29,7 @@ if [ -f "$ADMIN_SCRIPT" ]; then
         exec "$ADMIN_SCRIPT" "$@"
     fi
 else
-    curl -sL https://raw.githubusercontent.com/iu683/uu/main/uu.sh > "$ADMIN_SCRIPT"
+    curl -sL https://raw.githubusercontent.com/iu683/xx/main/aa.sh > "$ADMIN_SCRIPT"
     if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
         chmod +x "$ADMIN_SCRIPT"
         hash -r
@@ -242,17 +242,19 @@ show_status_and_info() {
     if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then
         
         # 1. 获取下一次执行的绝对时间
-        local raw_next=$(systemctl show "${SERVICE_NAME}.timer" --property=NextElapsUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_next" ] && [ "$raw_next" != "0" ] && [ "$raw_next" != "n/a" ]; then
-            next_run=$(date -d "@$((${raw_next} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        local raw_next=$(systemctl show "${SERVICE_NAME}.timer" \
+            --property=NextElapseUSecRealtime --value)
+
+        if [ -n "$raw_next" ] && [ "$raw_next" != "n/a" ]; then
+            next_run=$(date -d "$raw_next" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
         fi
 
-        # 2. 获取上一次触发的绝对时间（如果系统有记录就用系统的）
-        local raw_last=$(systemctl show "${SERVICE_NAME}.timer" --property=LastTriggerUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_last" ] && [ "$raw_last" != "0" ] && [ "$raw_last" != "n/a" ]; then
-            last_run=$(date -d "@$((${raw_last} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        fi
+        local raw_last=$(systemctl show "${SERVICE_NAME}.timer" \
+            --property=LastTriggerUSec --value)
 
+        if [ -n "$raw_last" ] && [ "$raw_last" != "n/a" ]; then
+            last_run=$(date -d "$raw_last" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
+        fi
         # 3. 【强力兜底】如果定时器没跑过(raw_last为0)，但日志里有手动跑完的记录，就从日志拿时间
         if [ "$last_run" == "无记录" ] && [ -f "$LOG_FILE" ]; then
             local log_time=$(grep "快照备份任务顺利结束" "$LOG_FILE" | tail -n 1 | awk '{print $1,$2}')
