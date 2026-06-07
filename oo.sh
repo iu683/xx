@@ -22,14 +22,18 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==============================================================================
-# 绝对首次运行下载逻辑：只要本地有文件，瞬间截断并直接本地运行，绝不重复下载
+# Alpine 专属：绝对首次运行下载逻辑
 # ==============================================================================
 if [ -f "$ADMIN_SCRIPT" ]; then
     if [ "$(readlink -f "$0" 2>/dev/null)" != "$ADMIN_SCRIPT" ]; then
         exec "$ADMIN_SCRIPT" "$@"
     fi
 else
-    curl -sL https://raw.githubusercontent.com/iu683/xx/main/oo.sh > "$ADMIN_SCRIPT"
+    # 针对 Alpine 优化，首次运行时强制先安装最基础的 curl 确保能拉取脚本
+    if ! command -v curl &>/dev/null; then
+        apk update && apk add curl &>/dev/null
+    fi
+    curl -sL https://raw.githubusercontent.com/iu683/uu/main/oo.sh > "$ADMIN_SCRIPT"
     if [ $? -eq 0 ] && [ -s "$ADMIN_SCRIPT" ]; then
         chmod +x "$ADMIN_SCRIPT"
         hash -r
@@ -96,11 +100,11 @@ run_backend_backup() {
         echo -e "${GREEN}正在打包本地核心系统文件，请稍候...${NC}"
     fi
 
-    # 系统核心打包 (屏蔽无关动态目录及快照自身)
+    # 系统核心打包 (使用 GNU tar 屏蔽无关动态目录及快照自身)
     tar -czf "$SNAPSHOT_FILE" \
       --exclude="/dev/*" --exclude="/proc/*" --exclude="/sys/*" --exclude="/tmp/*" --exclude="/run/*" \
       --exclude="/mnt/*" --exclude="/media/*" --exclude="/lost+found" --exclude="/var/cache/*" \
-      --exclude="/var/tmp/*" --exclude="/var/log/*" --exclude="/var/lib/apt/lists/*" \
+      --exclude="/var/tmp/*" --exclude="/var/log/*" \
       --exclude="${BACKUP_DIR}/*" \
       /boot /etc /usr /var /root /home /opt /bin /sbin /lib /lib64 > /dev/null 2>&1
 
@@ -115,11 +119,9 @@ run_backend_backup() {
         
         if [ $is_interactive -eq 1 ]; then
             echo -e "${GREEN}正在同步快照至远程服务器（展示实时进度）：${NC}"
-            # 交互式运行时展示原生进度条
             rsync -avz --progress --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/"
             local sync_res=$?
         else
-            # 定时任务静默运行
             rsync -avz --inplace --rsync-path="mkdir -p $FULL_REMOTE_PATH/system_snapshots && rsync" -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no" "$SNAPSHOT_FILE" "$TARGET_USER@$TARGET_IP:$FULL_REMOTE_PATH/system_snapshots/" &>/dev/null
             local sync_res=$?
         fi
@@ -128,7 +130,7 @@ run_backend_backup() {
             log_info "远程同步成功！文件已安全留存远端。"
             ssh -p "$SSH_PORT" -o StrictHostKeyChecking=no "$TARGET_USER@$TARGET_IP" "find \"$FULL_REMOTE_PATH/system_snapshots\" -type f -name '*.tar.gz' -mtime +$REMOTE_SNAPSHOT_DAYS -delete" &>/dev/null
             
-            # 定时清理本地过期快照
+            # 定时清理本地过期快照 (使用 GNU findutils 确保 maxdepth 兼容)
             find "$BACKUP_DIR" -maxdepth 1 -type f -name "system_snapshot_*.tar.gz" | sort -r | tail -n +$((LOCAL_SNAPSHOT_KEEP+1)) | xargs -r rm -f
             log_info "过期快照轮转清理完毕。"
 
@@ -167,7 +169,7 @@ run_backend_backup() {
     if [ $is_interactive -eq 0 ]; then exit 0; fi
 }
 
-# 检测由 systemd 定时器直接触发的后端运行
+# 检测由 OpenRC/Cron 后端运行触发
 if [ "$1" == "--backend-run" ]; then
     run_backend_backup "$@"
 fi
@@ -199,31 +201,8 @@ load_config() { if [ -f "$CONFIG_FILE" ]; then source "$CONFIG_FILE"; fi; }
 draw_header() {
     clear
     echo -e "${GREEN}=================================${NC}"
-    echo -e "${GREEN}     Linux 系统快照备份工具       ${NC}"
+    echo -e "${GREEN}         系统快照备份工具         ${NC}"
     echo -e "${GREEN}=================================${NC}"
-}
-
-# 时间纯汉化解析提取器
-parse_systemd_time() {
-    local raw_time="$1"
-    if [ -z "$raw_time" ] || [[ "$raw_time" == "n/a" ]] || [[ "$raw_time" == "N/A" ]]; then
-        echo "暂无记录"
-        return
-    fi
-    # 提取 YYYY-MM-DD HH:MM:SS 核心数据
-    local formatted=$(echo "$raw_time" | awk '{
-        for(i=1;i<=NF;i++) {
-            if($i ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}$/) {
-                print $i " " $(i+1)
-                exit
-            }
-        }
-    }')
-    if [ -n "$formatted" ]; then
-        echo "$formatted"
-    else
-        echo "$raw_time"
-    fi
 }
 
 show_status_and_info() {
@@ -234,36 +213,23 @@ show_status_and_info() {
         return 1
     fi
     
-    local timer_active="未激活"
-    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then timer_active="运行中"; fi
+    # 【修复】关键匹配词对齐，在 crontabs 中精准匹配实际脚本名称 snapshot.sh
+    local cron_active="未激活"
+    if [ -f "/etc/periodic/daily/system-snapshot" ] || grep -q "snapshot.sh" /etc/crontabs/root 2>/dev/null; then
+        if rc-service crond status &>/dev/null || rc-service dcron status &>/dev/null; then
+            cron_active="运行中 (Cron)"
+        else
+            cron_active="已配置 (Cron服务未启动)"
+        fi
+    fi
     
-    local last_run="无记录" local next_run="未安排"
-    # 修正这里的字符串匹配，或者直接判断 systemctl 状态
-    if systemctl is-active "${SERVICE_NAME}.timer" &>/dev/null; then
-        
-        # 1. 获取下一次执行的绝对时间
-        local raw_next=$(systemctl show "${SERVICE_NAME}.timer" --property=NextElapsUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_next" ] && [ "$raw_next" != "0" ] && [ "$raw_next" != "n/a" ]; then
-            next_run=$(date -d "@$((${raw_next} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        fi
-
-        # 2. 获取上一次触发的绝对时间（如果系统有记录就用系统的）
-        local raw_last=$(systemctl show "${SERVICE_NAME}.timer" --property=LastTriggerUSecRealtime --value 2>/dev/null)
-        if [ -n "$raw_last" ] && [ "$raw_last" != "0" ] && [ "$raw_last" != "n/a" ]; then
-            last_run=$(date -d "@$((${raw_last} / 1000000))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-        fi
-
-        # 3. 【强力兜底】如果定时器没跑过(raw_last为0)，但日志里有手动跑完的记录，就从日志拿时间
-        if [ "$last_run" == "无记录" ] && [ -f "$LOG_FILE" ]; then
-            local log_time=$(grep "快照备份任务顺利结束" "$LOG_FILE" | tail -n 1 | awk '{print $1,$2}')
-            if [ -n "$log_time" ]; then
-                last_run="$log_time (手动)"
-                
-                # 如果下次预计执行未安排，还可以用最后一次日志时间 + 间隔天数算个概数
-                if [ "$next_run" == "未安排" ]; then
-                    next_run=$(date -d "$log_time + ${BACKUP_INTERVAL_DAYS:-5} days" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
-                fi
-            fi
+    local last_run="无记录" local next_run="按周期自动触发"
+    if [ -f "$LOG_FILE" ]; then
+        local log_time=$(grep "快照备份任务顺利结束" "$LOG_FILE" | tail -n 1 | awk '{print $1,$2}')
+        if [ -n "$log_time" ]; then
+            last_run="$log_time"
+            # 【终极修复】采用秒级时间戳加减，100% 解决 Alpine 极简 BusyBox 环境下 date 的日期加减灵异 Bug
+            next_run=$(date -d "@$(($(date -d "$log_time" +"%s" 2>/dev/null || gdate -d "$log_time" +"%s") + ${BACKUP_INTERVAL_DAYS:-5} * 86400))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null)
         fi
     fi
     
@@ -273,7 +239,7 @@ show_status_and_info() {
         local_usage=$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')
     fi
     echo -e "${YELLOW}[ 自动化运行状态 ]${NC}"
-    echo -e "${GREEN} 定时任务状态:${NC} ${YELLOW}${timer_active}${NC}"
+    echo -e "${GREEN} 定时任务状态:${NC} ${YELLOW}${cron_active}${NC}"
     echo -e "${GREEN} 上次执行时间:${NC} ${YELLOW}${last_run}${NC}"
     echo -e "${GREEN} 下次预计执行:${NC} ${YELLOW}${next_run}${NC}"
     echo -e "${GREEN} 备份间隔天数:${NC} 每 ${YELLOW}${BACKUP_INTERVAL_DAYS:-'5'}${NC} 天自动触发一次"
@@ -288,15 +254,19 @@ show_status_and_info() {
     return 0
 }
 
+# Alpine 专属环境依赖补齐
 check_requirements() {
-    for cmd in curl ssh rsync tar hostname; do
-        if ! command -v $cmd &> /dev/null; then
-            if command -v apt-get &> /dev/null; then apt-get update && apt-get install -y $cmd &>/dev/null
-            elif command -v dnf &> /dev/null; then dnf install -y $cmd &>/dev/null
-            elif command -v yum &> /dev/null; then yum install -y $cmd &>/dev/null
-            fi
+    local missing_pkgs=""
+    for pkg in curl openssh-client rsync tar gawk coreutils findutils; do
+        if ! apk info -e $pkg &>/dev/null; then
+            missing_pkgs="$missing_pkgs $pkg"
         fi
     done
+    
+    if [ -n "$missing_pkgs" ]; then
+        echo -e "${GREEN}正在为 Alpine 补齐完整 GNU 核心工具链环境...${NC}"
+        apk update && apk add $missing_pkgs &>/dev/null
+    fi
 }
 
 auto_copy_ssh_key() {
@@ -317,7 +287,6 @@ auto_copy_ssh_key() {
     fi
 
     local PUBKEY_CONTENT=$(cat "$LOCAL_KEY")
-
     echo -e "${GREEN}⚠️ 第一次连接需要手动输入远程服务器密码进行鉴权操作${NC}"
 
     ssh -p "$port" -o ConnectTimeout=10 -o StrictHostKeyChecking=no "$user@$ip" "bash -s" <<EOF
@@ -351,35 +320,36 @@ EOF
     fi
 }
 
-setup_systemd_timer() {
-cat > "/etc/systemd/system/system-snapshot.service" << EOFSERVICE
-[Unit]
-Description=System Snapshot Backup Service
-After=network.target
+# Alpine 专属：使用 OpenRC 服务守护以及标准的 Crontab 触发器
+setup_alpine_cron() {
+    # 1. 编写 OpenRC 行程服务 (供手动或临时管理接口调用)
+    cat > "/etc/init.d/system-snapshot" << 'EOFSERVICE'
+#!/sbin/openrc-run
+description="System Snapshot Backup Service"
+command="/usr/bin/snapshot.sh"
+command_args="--backend-run"
 
-[Service]
-Type=oneshot
-ExecStart=$ADMIN_SCRIPT --backend-run
-WorkingDirectory=/tmp
+depend() {
+    need net
+}
 EOFSERVICE
+    chmod +x /etc/init.d/system-snapshot
 
-cat > "/etc/systemd/system/system-snapshot.timer" << EOFTIMER
-[Unit]
-Description=Run System Snapshot Every ${NEW_BACKUP_INTERVAL_DAYS} Days
-
-[Timer]
-OnCalendar=*-*-1/${NEW_BACKUP_INTERVAL_DAYS} 00:00:00
-RandomizedDelaySec=4h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOFTIMER
-
-    chmod 644 /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
-    systemctl enable "system-snapshot.timer" &>/dev/null
-    systemctl restart "system-snapshot.timer" &>/dev/null
+    # 2. 注入系统的 Crontab 定时器结构中
+    # 清理历史可能存在的同名旧配置
+    sed -i "/$SERVICE_NAME/d" /etc/crontabs/root 2>/dev/null
+    sed -i "/snapshot.sh/d" /etc/crontabs/root 2>/dev/null
+    
+    # 生成随机执行小时数（0-4点）和分钟数（0-59），模拟原 Systemd 的 RandomizedDelaySec 削峰机制
+    local rand_min=$((RANDOM % 60))
+    local rand_hour=$((RANDOM % 5))
+    
+    # 写入 Alpine 的 crontabs 主配置 (每 X 天运行一次)
+    echo "$rand_min $rand_hour */${NEW_BACKUP_INTERVAL_DAYS} * * $ADMIN_SCRIPT --backend-run >/dev/null 2>&1" >> /etc/crontabs/root
+    
+    # 重启并启动 Alpine 的 crond 调度服务
+    rc-update add crond default &>/dev/null
+    rc-service crond restart &>/dev/null
 }
 
 configure_project() {
@@ -432,16 +402,15 @@ BACKUP_INTERVAL_DAYS=$NEW_BACKUP_INTERVAL_DAYS
 EOF
     chmod 600 "$CONFIG_FILE"
     
-    setup_systemd_timer
+    setup_alpine_cron
     
-    echo -e "\n${GREEN}✓ 全新配置和 Systemd 自动化定时任务已同步刷新并生效！${NC}"
+    echo -e "\n${GREEN}✓ 全新配置和 Alpine Cron 自动化定时任务已同步刷新并生效！${NC}"
     read -p "按任意键返回主菜单..." -n 1
 }
 
 action_manual_backup() {
     if [ ! -f "$CONFIG_FILE" ]; then echo -e "${GREEN}错误: 请先进行配置再执行此操作。${NC}"; else
         echo -e "\n${GREEN}正在手动同步触发核心流程...${NC}"
-        # --interactive 参数用于向函数声明当前展示进度条
         $ADMIN_SCRIPT --backend-run --interactive
         echo -e "${GREEN}✓ 手动打包传输完整。${NC}"
     fi
@@ -459,13 +428,12 @@ test_telegram() {
     
     local FULL_REMOTE_PATH="$TARGET_BASE_DIR/$REMOTE_DIR_NAME"
     
-    # 消息转义处理
     local t_name=$(escape_markdown "${REMOTE_DIR_NAME:-未配置}")
     local t_path=$(escape_markdown "${FULL_REMOTE_PATH:-未配置}")
     local t_days=$(escape_markdown "${BACKUP_INTERVAL_DAYS:-5}")
     local t_time=$(escape_markdown "$(date '+%Y-%m-%d %H:%M:%S')")
 
-    local test_msg="🚀 *系统快照备份工具安装测试*
+    local test_msg="🚀 *系统快照备份工具 Alpine 安装测试*
 
 📱 如果您看到此消息，说明Telegram配置成功！
 🖥️ *本机名称*: \`$t_name\`  
@@ -473,7 +441,6 @@ test_telegram() {
 ⏰ *执行频率*: 每${t_days}天一次
 ⏱️ *时间*: \`$t_time\`"
 
-    # 执行带有响应捕获的发送
     local response=$(curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
         -d chat_id="$CHAT_ID" \
         -d text="$test_msg" \
@@ -496,12 +463,12 @@ action_view_logs() {
 }
 
 uninstall_project() {
-    systemctl stop system-snapshot.timer 2>/dev/null
-    systemctl disable system-snapshot.timer 2>/dev/null
-    rm -f /etc/systemd/system/system-snapshot.*
-    systemctl daemon-reload
+    sed -i "/$SERVICE_NAME/d" /etc/crontabs/root 2>/dev/null
+    sed -i "/snapshot.sh/d" /etc/crontabs/root 2>/dev/null
+    rc-service crond restart &>/dev/null
+    rm -f /etc/init.d/system-snapshot
     rm -f "$CONFIG_FILE" "$ADMIN_SCRIPT"
-    echo -e "${GREEN}✓ 快照工具及定时任务已从本机完全干净卸载。${NC}"
+    echo -e "${GREEN}✓ 快照工具及 Alpine 定时任务已从本机完全干净卸载。${NC}"
     exit 0
 }
 
@@ -530,4 +497,5 @@ menu_loop() {
     done
 }
 
+# 启动菜单主循环
 menu_loop
